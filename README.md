@@ -1,14 +1,10 @@
 # Governed Reporting Data Mart on Snowflake
 
 > A code-first, governed Snowflake data mart that re-platforms legacy BI reports
-> onto canonical, parity-validated SQL models, with query-time currency
-> conversion and an automated refresh + audit pipeline.
+> onto canonical, parity-validated SQL models.
 
-> **Portfolio note.** This document describes a production data-engineering system
-> I designed and built. Organisation-, database-, schema-, table-, role-, and
-> warehouse-specific names have been replaced with neutral placeholders
-> (`SRC_DB`, `MART_DB`, `RPT_SCHEMA`, `CANON_REVENUE`, …). The architecture,
-> patterns, and trade-offs are unchanged.
+> **Portfolio note.** A production system I designed and built; real object names
+> are replaced with neutral placeholders (`SRC_DB`, `MART_DB`, `RPT_SCHEMA`, …).
 
 ---
 
@@ -43,7 +39,7 @@ daily/weekly); no per-report bespoke pipelines.
 | Placeholder | Real-world role |
 |---|---|
 | `SRC_DB` | Read-only enterprise source database (data-share / BYOD style) |
-| `SRC_SCHEMA_FIN` | Source schema holding FX-rate + calendar lookups (direct read grant) |
+| `SRC_SCHEMA_LKP` | Source schema holding FX-rate + calendar lookups (direct read grant) |
 | `SRC_SCHEMA_A/B/C` | Source fact + dimension schemas (Revenue, Project, Accounting), restricted access |
 | `MART_DB` | The mart database, one copy per environment (`_DEV` / `_TST` / `_PRD`) |
 | `RPT_SCHEMA` | The single reporting schema inside `MART_DB` |
@@ -147,7 +143,7 @@ possible when reading the source secure views directly.
 ```mermaid
 graph TB
     subgraph SRC["SRC_DB (read-only)"]
-        FIN["SRC_SCHEMA_FIN<br/>FX + calendar (direct grant)"]
+        FIN["SRC_SCHEMA_LKP<br/>FX + calendar (direct grant)"]
         FACTS["SRC_SCHEMA_A/B/C<br/>facts + dimensions (secondary role)"]
     end
 
