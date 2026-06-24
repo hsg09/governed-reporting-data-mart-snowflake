@@ -1,188 +1,187 @@
 # Governed Reporting Data Mart on Snowflake
 
-> A code-first, governed Snowflake data mart that re-platforms legacy BI reports
-> onto canonical, parity-validated SQL models.
+> A Snowflake reporting platform that rebuilds a suite of legacy finance reports
+> as clean, version-controlled SQL — with automatic checks that the new numbers
+> match the originals.
 
-> **Portfolio note.** A production system I designed and built; real object names
-> are replaced with neutral placeholders (`SRC_DB`, `MART_DB`, `RPT_SCHEMA`, …).
+> **Portfolio note.** A production system I designed and built. Real object names
+> are replaced with simple placeholders (`SRC_DB`, `MART_DB`, `RPT_SCHEMA`, …).
 
 ---
 
 ## 1. Problem & goals
 
-A finance organisation ran dozens of certified reports in a legacy BI platform
-whose logic was locked inside a GUI: opaque, hard to govern, and costly to
-change. This system re-platforms those reports onto a governed Snowflake mart
-defined entirely in version-controlled SQL. Many wide source facts are
-consolidated onto a small set of canonical tables, and every figure stays
-traceable to the source through automated parity validation.
+**Problem.** A finance team depended on dozens of business-critical reports built
+in an older reporting tool, where the logic was locked inside the tool's
+interface: not visible, not reviewable, and hard to change or hand over. Because
+those reports inform real decisions, any replacement had to return *exactly* the
+same numbers while being far easier to understand, govern, and maintain.
 
-**Scope:** ~5 reporting domains, ~40 reports, 8 canonical models, and an automated
-refresh + audit pipeline. Built on Snowflake and SQL; all logic version-controlled
-in Git.
+**Goals.** Rebuild those reports on Snowflake, with all the logic written as plain
+SQL kept in Git, so that the new system:
 
-| Goal | How the design delivers it |
-|---|---|
-| **1:1 fidelity** with the legacy reports | Each report has a parity script that diffs it against the original source logic |
-| **Governed single source of truth** | All logic in Git; one reporting schema per environment; read-only source |
-| **Performance & cost control** | The heavy joins are materialised once; currency conversion is deferred to query time |
-| **Self-service** | Consumers read clean governed tables with no elevated privileges |
-| **Operability** | One convention-driven refresh procedure, environment isolation, and a per-run audit log |
+- gives the **same numbers as the old reports**, with automatic checks that prove they match;
+- becomes the **one trusted source** for the data — it only reads from the source system, and Dev / Test / Prod are kept separate;
+- is **fast and cost-efficient** — the heavy work is done once, and currencies are converted only when a report runs;
+- lets people **get the data themselves**, without needing special access;
+- is **easy to run and monitor** — a single refresh process, with every run logged.
 
-**Non-goals:** no write-back to the source; no real-time streaming (reporting is
-daily/weekly); no per-report bespoke pipelines.
+**Scope:** about 5 reporting areas, ~40 reports, 8 core data models, and an
+automated refresh + logging process. Built on Snowflake with SQL; everything
+version-controlled in Git.
+
+**Out of scope:** the platform never changes the source data (read-only); it is
+not real-time (reports refresh daily/weekly); and there are no one-off custom
+pipelines per report.
 
 ---
 
 ## 2. Naming legend (placeholders)
 
-| Placeholder | Real-world role |
+What each placeholder in this document refers to:
+
+| Placeholder | What it is |
 |---|---|
-| `SRC_DB` | Read-only enterprise source database (data-share / BYOD style) |
-| `SRC_SCHEMA_LKP` | Source schema holding FX-rate + calendar lookups (direct read grant) |
-| `SRC_SCHEMA_A/B/C` | Source fact + dimension schemas (Revenue, Project, Accounting), restricted access |
-| `MART_DB` | The mart database, one copy per environment (`_DEV` / `_TST` / `_PRD`) |
-| `RPT_SCHEMA` | The single reporting schema inside `MART_DB` |
-| `CANON_*` | Canonical fact tables (e.g. `CANON_REVENUE`, `CANON_WINS`) |
-| `V_*` / `VS_*` | Canonical views / report "shape" views |
-| `LKP_FX`, `LKP_CAL` | Local FX-rate and calendar lookup tables |
-| `ROLE_MART` | Role that owns and reads the mart objects |
-| `ROLE_SRC_READ` | Secondary role; the only path to read the restricted source schemas |
-| `WH_LOAD` | Compute warehouse used for refresh and loads |
-| `FN_FX(amount, rate)` | Currency-conversion UDF |
-| `SP_REFRESH_ALL` / `SP_REFRESH_ONE` | Refresh orchestration procedures |
-| `REFRESH_AUDIT` | Refresh audit-log table |
+| `SRC_DB` | The source system we read from (read-only) |
+| `SRC_SCHEMA_LKP` | The part of the source with exchange-rate and calendar lookups (we can read it directly) |
+| `SRC_SCHEMA_A/B/C` | The parts of the source with the main business data (restricted — special access needed) |
+| `MART_DB` | Our own database; a separate copy for each environment (`_DEV` / `_TST` / `_PRD`) |
+| `RPT_SCHEMA` | The single area inside our database where everything lives |
+| `CANON_*` | Our core, cleaned-up data tables (e.g. `CANON_REVENUE`, `CANON_WINS`) |
+| `V_*` / `VS_*` | Views (saved queries) that define and shape the data |
+| `LKP_FX`, `LKP_CAL` | Our local copies of the exchange-rate and calendar lookups |
+| `ROLE_MART` | The access role that owns and reads our data |
+| `ROLE_SRC_READ` | The special access role needed to read the restricted source |
+| `WH_LOAD` | The compute engine used to build and refresh the data |
+| `FN_FX(amount, rate)` | A small function that converts an amount into another currency |
+| `SP_REFRESH_ALL` / `SP_REFRESH_ONE` | The routines that rebuild the data |
+| `REFRESH_AUDIT` | A log table that records every refresh |
 
 ---
 
 ## 3. Architecture & design
 
-The mart sits between a restricted read-only source and the reporting consumers.
-It exposes three layers inside a single schema, replicated per environment.
+The platform sits between the read-only source and the people using the reports.
+Inside one area of our database it has three simple layers, and there is a full,
+separate copy for each environment (Dev / Test / Prod).
 
 ```mermaid
 graph LR
     subgraph SRC["SRC_DB — read-only source"]
-        FACTS["Facts + dimensions<br/>(restricted schemas)"]
-        LKPS["FX rates + calendar<br/>(lookup schema)"]
+        FACTS["Main business data<br/>(restricted)"]
+        LKPS["Exchange rates + calendar<br/>(lookups)"]
     end
 
     subgraph MART["MART_DB.RPT_SCHEMA — one copy per environment (DEV / TST / PRD)"]
         direction LR
-        UV["L2 · Canonical views<br/>join facts + dimensions (read live)"]
-        MT["L2 · Canonical tables<br/>materialised snapshot"]
-        RP["L3 · Report queries<br/>apply currency at query time"]
-        FXC[("L1 · FX + calendar<br/>local auto-refreshed copy")]
+        UV["L2 · Core views<br/>join the source data (read live)"]
+        MT["L2 · Core tables<br/>saved snapshot"]
+        RP["L3 · Report queries<br/>convert currency as they run"]
+        FXC[("L1 · Rates + calendar<br/>local self-updating copy")]
         UV --> MT --> RP
-        FXC -. join at query time .-> RP
+        FXC -. used when a report runs .-> RP
     end
 
-    ORCH["External scheduler"]
-    CONS["Consumers<br/>BI tools · ad-hoc SQL"]
+    ORCH["Scheduler<br/>(runs the refresh)"]
+    CONS["Users<br/>BI tools · ad-hoc SQL"]
 
-    FACTS -->|read live via secondary role| UV
-    LKPS  -->|mirrored locally as auto-refresh tables| FXC
+    FACTS -->|read live, with special access| UV
+    LKPS  -->|copied locally, self-updating| FXC
     ORCH  -->|trigger refresh| MT
     RP --> CONS
 ```
 
-Only two things physically land in the mart: the materialised canonical tables (a
-snapshot of each canonical view) and a local copy of the FX/calendar lookups. The
-source facts are read live, never duplicated, and currency conversion happens at
-report time rather than in storage.
+Almost nothing is copied into the platform. Only two things are actually stored:
+our core tables (a saved snapshot of each model) and a local copy of the
+exchange-rate and calendar lookups. The large source tables are read live while
+we rebuild, never duplicated, and currency conversion happens when a report runs
+rather than being stored.
 
-| Layer | Holds | Built by | Grain |
-|---|---|---|---|
-| **L1 Lookups** | FX + calendar, mirrored locally | Self-refreshing tables (full refresh) | source rows |
-| **L2 Canonical** | 8 view→table pairs, one per source fact | Refresh procedure (`INSERT OVERWRITE … SELECT * FROM V_*`) | source fact grain |
-| **L3 Report** | Shape views + report queries | `CREATE VIEW` / consumer SQL | report grain |
-
-**Design invariants**
-
-- Canonicals stay at source fact grain; all dimension joins are 1:1, so row count equals the fact.
-- Measures are stored currency-agnostic (suffix `_SRC`); FX is applied by consumers, never materialised, so one lean canonical serves any target currency.
-- Shape views are projection-only (no filters, no FX) and keep the source currency in the grain.
-- Consumers read only `RPT_SCHEMA`, so no consumer needs the secondary role.
-- Each environment owns a full, independent copy; there is no cross-environment coupling.
-
-Each canonical is a **view + table pair**: the view carries the join logic and is
-the re-runnable refresh query; the table is the materialised snapshot consumers
-read. A canonical cannot be a self-refreshing object because it reads source
-schemas reachable only through a secondary role, and Snowflake's automatic-refresh
-mechanisms ignore secondary roles (see §4). The views also **aggregate the slim
-fact on its foreign keys before joining dimensions**, which keeps the wide payload
-out of the join and holds the table at fact grain.
-
-### Why an owned, materialised layer
-
-The source exposes only secure views: read-only, and reachable solely through a
-secondary role. That removes most of the levers needed for performance,
-evolution, and stability. Materialising into a schema we own converts that opaque
-dependency into governed, tunable assets, and is the primary justification for the
-design.
-
-| Dimension | Reading source secure views | Owning the canonical layer |
+| Layer | What it holds | How it's built |
 |---|---|---|
-| Access | Read-only `SELECT`; no DDL | Full ownership: DDL, grants, retention |
-| Physical tuning | None (no clustering, no write-ordering) | Cluster keys, load ordering, pre-aggregation |
-| Refresh model | Incremental/auto-refresh impossible (no change tracking; secondary-role) | Procedure-materialised with snapshot semantics |
-| Stability | Live reads exposed to upstream change mid-query | Atomic snapshot per refresh; reproducible reporting |
-| Access path | Reachable only via the secondary role | Consumers read plain tables; no elevated role |
+| **L1 Lookups** | Local copies of exchange rates + calendar | Update themselves automatically |
+| **L2 Core models** | 8 cleaned tables, one per source area | Rebuilt by a routine that saves a snapshot of the view |
+| **L3 Reports** | Report queries (and light "shape" views) | Plain SQL that users run |
 
-Owning the layer also makes the physical design deliberate: cluster keys and load
-ordering are chosen from the columns reports actually filter (scenario, fiscal
-year, posting/week dates) so Snowflake prunes micro-partitions; the heavy
-multi-dimension join is computed once per refresh and amortised across every
-report; and deferring FX avoids a combinatorial storage blow-up. None of this is
-possible when reading the source secure views directly.
+**Key principles**
+
+- Each core table stays at the same level of detail as its source, so totals can't accidentally change when descriptive columns are added.
+- Amounts are stored in their original currency; conversion happens at report time, so one table can serve any currency.
+- Users only ever read our own area — they never need special access to the source.
+- Each environment (Dev / Test / Prod) is a full, independent copy; they don't affect each other.
+
+Each model is a **pair**: a *view* (a saved query that holds the logic) and a
+*table* (a stored snapshot that people read). The table can't refresh itself
+automatically, because reading the restricted source needs special access that
+Snowflake's automatic-refresh features don't support. So a small routine, run with
+that access, rebuilds the table from the view. To keep it fast, the view also
+**summarises the large source table first, then adds the descriptive columns**, so
+the wide source data isn't carried through every join.
+
+### Why we keep our own copy
+
+The source only lets us read it through locked-down views: read-only, and
+reachable only with special access. That takes away almost everything we'd need to
+make reporting fast, reliable, and easy to change. Copying the data into tables we
+own turns that limited, hidden dependency into data we fully control.
+
+| | Reading the source directly | Keeping our own copy |
+|---|---|---|
+| **Control** | Read-only; can't change or tune anything | We own the tables and can shape and manage them |
+| **Speed** | No way to tune for performance | We arrange the data around how reports filter it, so queries stay fast |
+| **Refresh** | Can't refresh automatically | We control when and how it rebuilds |
+| **Reliability** | Numbers could shift while a report is running | Each rebuild is a clean snapshot — stable, repeatable |
+| **Access** | Needs special source access | People read normal tables; no special access |
+
+Owning the data also makes performance a deliberate choice: we store rows in the
+order reports tend to read them, so the engine can skip the parts it doesn't need;
+we do the expensive joining once rather than on every query; and we avoid bloating
+storage by converting currency only when a report runs.
 
 ---
 
-## 4. Data flow & access model
+## 4. Data flow & access
 
 ```mermaid
 graph TB
     subgraph SRC["SRC_DB (read-only)"]
-        FIN["SRC_SCHEMA_LKP<br/>FX + calendar (direct grant)"]
-        FACTS["SRC_SCHEMA_A/B/C<br/>facts + dimensions (secondary role)"]
+        FIN["SRC_SCHEMA_LKP<br/>rates + calendar (direct read)"]
+        FACTS["SRC_SCHEMA_A/B/C<br/>main data (special access)"]
     end
 
     subgraph RPT["MART_DB.RPT_SCHEMA"]
-        L1["L1 Lookups<br/>LKP_FX · LKP_CAL (auto-refresh, FULL)"]
-        L2["L2 Canonical<br/>V_CANON_* → CANON_*"]
-        L3["L3 Report layer<br/>shape views + report queries"]
+        L1["L1 Lookups<br/>LKP_FX · LKP_CAL (self-updating)"]
+        L2["L2 Core<br/>V_CANON_* → CANON_*"]
+        L3["L3 Reports<br/>report queries + shape views"]
         SP["SP_REFRESH_ALL → SP_REFRESH_ONE"]
         LOG["REFRESH_AUDIT"]
     end
 
-    APP["BI tools · ad-hoc SQL<br/>(ROLE_MART only)"]
+    APP["BI tools · ad-hoc SQL<br/>(normal access only)"]
 
-    FIN  -->|auto full refresh| L1
-    FACTS -.->|read live via ROLE_SRC_READ at refresh time| L2
-    SP   -->|INSERT OVERWRITE from V_*| L2
+    FIN  -->|self-updating copy| L1
+    FACTS -.->|read live, special access, at refresh time| L2
+    SP   -->|rebuild snapshot from V_*| L2
     SP   -->|trigger refresh| L1
     SP   --> LOG
     L2 --> L3
-    L1 -->|FX + previous-week| L3
+    L1 -->|rates + latest week| L3
     L3 --> APP
 ```
 
-Source data reaches the mart through **two mechanisms**, each dictated by how the
-source can be read:
+Data gets into the platform in two ways, depending on how each part of the source
+can be read:
 
-| Object set | Source | Mechanism | Refresh |
+| What | From | How it gets in | When it refreshes |
 |---|---|---|---|
-| **Local lookups** (FX, calendar) | direct read grant | self-refreshing tables | platform scheduler (full) |
-| **Canonical tables** | restricted fact/dim schemas (secondary role) | view materialised via `INSERT OVERWRITE` by a procedure | `SP_REFRESH_ALL` |
+| **Lookups** (rates, calendar) | readable directly | copied into local tables | automatically |
+| **Core tables** | restricted source | a routine reads the source and saves a snapshot | when the refresh runs |
 
-The role boundary is the single most influential constraint on the design. The
-refresh session activates `ROLE_SRC_READ` as a **secondary role** to read the
-restricted source; the materialised write is done by `ROLE_MART`, which owns
-`RPT_SCHEMA`. Because the consumer layer reads only the materialised tables and
-the local lookups, **consumers never need the secondary role** — the cross-boundary
-read is confined to refresh time. The owning role also lacks `ALTER` on the source
-lookups, so change tracking cannot be enabled and the lookup tables refresh in
-full rather than incrementally.
+Access is the biggest design driver. The restricted source can only be read with a
+special add-on access role, and **only the rebuild process uses it**. Everyday
+users read our finished tables, so **they never need that special access**. And
+because we can only read (not change) the source lookups, we copy them in full
+each time rather than just the changes.
 
 ---
 
@@ -190,59 +189,51 @@ full rather than incrementally.
 
 ```mermaid
 graph TD
-    ORCH["External scheduler<br/>(sets secondary role in session)"] --> ALL["SP_REFRESH_ALL()"]
-    ALL -->|discovers objects from metadata| ONE["SP_REFRESH_ONE(name)"]
-    ONE -->|auto-refresh object| DT["trigger full refresh"]
-    ONE -->|view→table pair| BT["INSERT OVERWRITE INTO name<br/>SELECT * FROM V_name"]
-    DT --> LOG["REFRESH_AUDIT (one row per object per run)"]
+    ORCH["Scheduler<br/>(turns on special access for the session)"] --> ALL["SP_REFRESH_ALL()"]
+    ALL -->|finds everything to rebuild| ONE["SP_REFRESH_ONE(name)"]
+    ONE -->|self-updating item| DT["refresh it"]
+    ONE -->|view + table| BT["rebuild the table<br/>from its view"]
+    DT --> LOG["REFRESH_AUDIT (one row per item per run)"]
     BT --> LOG
 ```
 
-- `SP_REFRESH_ALL` discovers every refreshable object from metadata at runtime, so
-  a new canonical registers simply by following the `V_<name>` + `<name>`
-  convention, with no change to the orchestration code.
-- `SP_REFRESH_ONE(name)` refreshes a single object for partial recovery or debugging.
-- Every run writes an audit row (object, tier, timing, row count, status, error,
-  invoked-by) to `REFRESH_AUDIT`.
-- Scheduling is **external**: the owning role lacks task privileges and tasks
-  ignore secondary roles, so the refresh runs from an orchestrator that sets the
-  secondary role in-session. Moving to native scheduling is a one-line change if
-  the privilege is granted.
+- `SP_REFRESH_ALL` finds everything that needs rebuilding on its own. Add a new model that follows the naming convention and it's picked up with no code changes.
+- `SP_REFRESH_ONE` rebuilds a single item on its own, for a targeted fix or partial recovery.
+- Every rebuild writes a log row: what ran, how long it took, how many rows, and whether it succeeded or failed.
+- An external scheduler runs it, because our access role isn't permitted to schedule jobs inside Snowflake. Moving to Snowflake's built-in scheduling later would be a small change.
 
 ---
 
-## 6. External file ingestion
+## 6. External file loads
 
-Some datasets arrive as periodic external files (for example a CRM extract or an
-HR matrix) rather than from the governed source. These take a separate,
-client-driven path, independent of the canonical refresh.
+Some data doesn't come from the main source — it arrives as a file (for example, a
+CRM or HR export). These follow a separate, simple path:
 
 ```mermaid
 graph LR
-    CSV["Periodic CSV extract"] -->|upload to stage| STG["Internal stage"]
-    STG -->|generic loader: TRUNCATE + COPY| TBL["Landing table (all-text)"]
+    CSV["Periodic file (CSV)"] -->|upload| STG["Staging area"]
+    STG -->|reusable loader: replace all| TBL["Landing table (plain text)"]
     TBL --> VW["Typed view"]
     VW --> RQ["Report query"]
 ```
 
-- **All-text landing** so a malformed or blank value never fails the load; types are applied in the view.
-- **Full replace** (truncate + copy) preserves grants and downstream access across reloads.
-- A **single generic loader** derives the column list from the table definition, so a new file dataset needs only a table and a view, not new load code.
+- Everything loads as **plain text first**, so a bad or empty value never breaks the load; the correct data types are applied afterwards in a view.
+- Each load **fully replaces** the previous file's data, while keeping all access settings intact.
+- **One reusable loader** handles any file, so a new file type only needs a table and a view — no new code.
 
 ---
 
 ## 7. Quality & validation
 
-Every report ships with a parity script that runs the original source logic and
-the new mart-backed query side by side and emits a PASS/FAIL per slice (for
-example, per fiscal year). This makes "1:1 with the legacy report" a checkable
-property rather than an assertion, and it doubles as a regression guard whenever a
-canonical changes.
+Every report comes with a check that runs the old logic and the new version side
+by side and reports **PASS or FAIL** for each slice (for example, each year). This
+turns "the numbers match the old report" into something we actually prove — and it
+catches any accidental change later on.
 
 ```mermaid
 graph LR
-    BO["Original source logic<br/>(embedded verbatim)"] --> CMP{Diff per slice}
-    NEW["New mart-backed query"] --> CMP
-    CMP -->|within tolerance| PASS["PASS"]
-    CMP -->|drift| FAIL["FAIL → investigate"]
+    BO["Old report logic"] --> CMP{Compare per slice}
+    NEW["New version"] --> CMP
+    CMP -->|matches| PASS["PASS"]
+    CMP -->|differs| FAIL["FAIL → investigate"]
 ```
