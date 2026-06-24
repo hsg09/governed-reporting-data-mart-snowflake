@@ -97,10 +97,10 @@ graph LR
     RP --> CONS
 ```
 
-**Key idea:** only two things physically land in the mart — the **materialised
-canonical tables** (a snapshot of each canonical view) and a **local copy of the
-FX/calendar lookups**. Source facts are read live, never duplicated. Currency
-conversion happens at report time, not in storage.
+Only two things physically land in the mart: the materialised canonical tables
+(a snapshot of each canonical view) and a local copy of the FX/calendar lookups.
+Source facts are read live, never duplicated, and currency conversion happens at
+report time rather than in storage.
 
 | Concern | Approach |
 |---|---|
@@ -373,12 +373,12 @@ graph LR
 
 ---
 
-## 13. Optimization & physical design — we own the physical layer
+## 13. Physical design & optimisation
 
-A core architectural payoff: because the canonical layer is **data we own** — not
-a pass-through to upstream secure views — we control the entire physical design
-and can tune for the workload's real access patterns. Consuming the upstream
-secure views directly gave us *none* of these levers.
+Owning the canonical layer, rather than reading the upstream secure views
+directly, puts the full physical design under our control and lets us tune for
+the workload's real access patterns. Each lever below is one the secure-view
+dependency did not expose.
 
 | Lever | What we do | Why it matters |
 |---|---|---|
@@ -390,23 +390,21 @@ secure views directly gave us *none* of these levers.
 | **Bounded rolling window** | Fact constrained to a multi-year window | Storage and refresh time stay linear and predictable |
 | **Projection-only shape views** | Push only needed columns; keep per-row sums single-currency | Better pruning and warehouse result-cache hit-rates for the explorer |
 
-On the upstream secure views we **could not** cluster, could not influence
-statistics or write-ordering, could not pre-aggregate, and every consumer query
-re-ran the full opaque join live across the secondary-role boundary. Owning the
-materialised layer turns all of that into deliberate, measurable engineering
-choices.
+None of this was available against the secure views: no clustering, no control
+over write-ordering or statistics, no pre-aggregation, and every consumer query
+re-ran the full join live across the secondary-role boundary. Materialising into
+an owned layer turns each of those into an explicit engineering decision.
 
 ---
 
 ## 14. Architectural justification — from read-only secure views to an owned, governed layer
 
-The mart deliberately interposes an **owned, materialised layer** between a
-restricted upstream and the consumers. Upstream exposed only **secure views,
-read-only, reachable through a secondary role** — which strips away nearly every
-lever an engineer needs for performance, evolution, stability, and operability.
-Materialising into our own schema converts that opaque, restricted dependency
-into **governed assets we fully control**. This is the central justification for
-the architecture.
+The mart deliberately interposes an owned, materialised layer between a
+restricted upstream and the consumers. The upstream exposes only secure views:
+read-only, and reachable through a secondary role. That arrangement removes most
+of the levers an engineer relies on for performance, evolution, stability, and
+operability. Materialising into a schema we own converts that opaque, restricted
+dependency into governed assets, and is the primary justification for the design.
 
 | Dimension | Before — consuming upstream **secure views** | After — owning the **canonical layer** |
 |---|---|---|
@@ -419,11 +417,11 @@ the architecture.
 | **Coupling** | Every report re-joined opaque views live across the boundary | Heavy join materialised once; reports decoupled from upstream |
 | **Schema evolution** | Couldn't add columns or derivations | Add derived columns, correct types, reshape grain in our own layer |
 
-**In short:** we traded a brittle, opaque, read-only dependency for a governed
-layer where **performance, data shape, refresh, and access are ours to engineer**.
-The secondary-role / secure-view constraints upstream aren't worked *around* — the
-architecture absorbs them at a single controlled boundary (the refresh procedure)
-so that everything downstream is fast, governed, and self-service.
+Net effect: a brittle, opaque, read-only dependency becomes a governed layer in
+which performance, data shape, refresh cadence, and access are all decisions we
+own. The secondary-role and secure-view constraints are not worked around but
+absorbed at a single boundary, the refresh procedure, leaving everything
+downstream fast, governed, and self-service.
 
 ---
 
