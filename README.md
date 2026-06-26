@@ -1,8 +1,7 @@
 # Governed Reporting Data Mart on Snowflake
 
 > A Snowflake reporting platform that rebuilds a suite of legacy finance reports
-> as clean, version-controlled SQL — with automatic checks that the new numbers
-> match the originals.
+> as clean, version-controlled SQL.
 
 > **Portfolio note.** A production system I designed and built. Real object names
 > are replaced with simple placeholders (`SRC_DB`, `MART_DB`, `RPT_SCHEMA`, …).
